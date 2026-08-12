@@ -8,8 +8,8 @@ COMM_PARAM_SERIAL_PORT = "serial_port"
 COMM_PARAM_BAUDRATE = "baudrate"
 COMM_PARAM_PARITY = "parity"
 COMM_PARAM_BYTESIZE = "bytesize"
-COMM_PARAM_DATA_BITS = "data_bits"
-COMM_PARAM_STOP_BITS = "stop_bits"
+COMM_PARAM_DATA_BITS = "databits"
+COMM_PARAM_STOP_BITS = "stopbits"
 
 # =============================================================================
 # 数据状态码 (HJ212-2025 附录 B)
