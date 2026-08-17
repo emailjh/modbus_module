@@ -24,7 +24,11 @@ from PySide6.QtCore import QMetaObject, Q_ARG, Qt, Signal, QObject, QMutex, QThr
 from modbus_module.buffers import RingBuffer
 from modbus_module.interfaces import IModbusClient, ModbusException
 from modbus_module.utils.cache_db import CacheDB
-from modbus_module.utils.conversion import modbus_to_float, modbus_to_int32, modbus_to_int16, ppm_to_ugm3, ppb_to_ugm3
+from modbus_module.utils.conversion import (
+    modbus_to_float, modbus_to_int32, modbus_to_int16,
+    ppm_to_ugm3, ppb_to_ugm3, float_to_registers,
+    int32_to_registers, string_to_registers, modbus_to_string
+)
 from modbus_module.utils.logger import get_logger
 
 
@@ -76,6 +80,11 @@ class _CommunicatorWorker(QThread):
         self._mutex = QMutex()
         self._logger = logger or get_logger(__name__)
 
+    @property
+    def device_id(self) -> str:
+        """设备唯一标识（只读）"""
+        return self._device_id
+
     # ---------- 公共槽（可跨线程安全调用） ----------
     @Slot(dict)
     def send_command(self, command: Dict[str, Any]):
@@ -95,22 +104,10 @@ class _CommunicatorWorker(QThread):
         """
         管理设备连接状态，封装了连接状态检查、重连、标志同步与信号发射的全部逻辑，返回 bool 表示当前是否可以开始采集。
         同时负责更新内部标志并发射 connection_changed 信号。
-
-        返回值：
-        True 表示连接就绪（可采集）
-        False 表示需等待后重试。
         """
-        # 期望状态临时变量
         new_state = self._connected
 
-        # 如果内部标记未连接，先主动关闭旧连接
-        if not self._connected:
-            try:
-                self._client.disconnect()
-            except Exception as e:
-                self._logger.debug("Device no - %s disconnect cleanup exception: %s", self._device_id, e)
-
-        # 物理连接正常
+        # 直接检查物理连接状态
         if self._client.is_connected:
             new_state = True
         else:
@@ -147,7 +144,7 @@ class _CommunicatorWorker(QThread):
             try:
                 # 1. 处理命令队列中的即时命令
                 cmd = self._request_queue.get()
-                if cmd:
+                if cmd is not RingBuffer.EMPTY:   # 使用哨兵对象判断是否为空
                     self._handle_command(cmd)
 
                 # 2. 连接管理（False - 连接未就绪时跳过采集并等待下一轮循环）
@@ -209,7 +206,7 @@ class _CommunicatorWorker(QThread):
             self._logger.error("Reconnect failed for device no - %s: %s", self._device_id, e)
             return False
 
-    def _collect_data(self) -> Optional[Dict[str, float]]:
+    def _collect_data(self) -> Optional[Dict[str, Any]]:
         """
         根据因子配置采集所有启用的因子。
         单个因子失败时将值设为 None 并记录警告；
@@ -229,8 +226,23 @@ class _CommunicatorWorker(QThread):
 
             total_count += 1
             try:
+                # 根据数据类型自动确定所需寄存器数量（仅当用户未显式指定 register_count 时）
+                data_type = cfg.get("data_type", "int16")
+                if "register_count" in cfg and cfg.get("register_count") is not None:
+                    reg_count = cfg.get("register_count")
+                else:
+                    # 32 位数据类型需要 2 个寄存器，其他默认 1 个
+                    if data_type in ("float", "int32", "uint32"):
+                        reg_count = 2
+                    elif data_type == "string":
+                        # 字符串类型必须显式指定 register_count，否则默认读 1 个寄存器（2个字符）
+                        self._logger.warning("String factor %s missing register_count, default to 1", factor)
+                        reg_count = 1
+                    else:
+                        reg_count = 1
+
                 registers = self._client.read_holding_registers(
-                    self._unit_id, address, cfg.get("register_count", 1)
+                    self._unit_id, address, reg_count
                 )
                 raw_value = self._parse_registers(registers, cfg)
                 standard_value = self._apply_conversion(raw_value, cfg)
@@ -252,17 +264,29 @@ class _CommunicatorWorker(QThread):
 
         return result
 
-    def _parse_registers(self, registers: List[int], cfg: Dict[str, Any]) -> float:
+    def _parse_registers(self, registers: List[int], cfg: Dict[str, Any]) -> Any:
         """
         将原始寄存器值转换为物理量（未进行单位转换的原始值）。
-        支持 int16, uint16, int32, uint32, float32 等类型及各种字节序。
+        支持 int16, uint16, int32, uint32, float, string 等类型及各种字节序。
         """
         data_type = cfg.get("data_type", "int16")
         byte_order = cfg.get("byte_order", "big_endian")
         scale = cfg.get("scale", 1.0)
         offset = cfg.get("offset", 0.0)
 
-        if data_type == "float32":
+        # 字符串类型不需要数量校验
+        if data_type != "string":
+            expected_count = 2 if data_type in ("float", "int32", "uint32") else 1
+            if len(registers) != expected_count:
+                self._logger.warning(
+                    "Register count mismatch for factor %s: expected %d, got %d. Data type %s",
+                    cfg.get("factor", "unknown"), expected_count, len(registers), data_type
+                )
+                # 对于 32 位类型，若寄存器不足，抛出异常，由上层处理（单因子失败不影响其他因子）
+                if len(registers) < expected_count:
+                    raise ModbusException(f"Insufficient registers for {data_type}")
+
+        if data_type == "float":
             val = modbus_to_float(registers, byte_order)
         elif data_type in ("int32", "uint32"):
             signed = (data_type == "int32")
@@ -270,6 +294,9 @@ class _CommunicatorWorker(QThread):
         elif data_type in ("int16", "uint16"):
             signed = (data_type == "int16")
             val = modbus_to_int16(registers[0], signed)
+        elif data_type == "string":
+            val = modbus_to_string(registers, byte_order)
+            return val
         else:
             # 默认按有符号16位处理
             val = modbus_to_int16(registers[0], True)
@@ -293,13 +320,117 @@ class _CommunicatorWorker(QThread):
         return raw_value
 
     def _handle_command(self, command: Dict[str, Any]):
-        """处理即时命令，如对时写入、校准控制等"""
+        """
+        处理即时命令，如对时写入、校准控制、带数据类型的写入等。
+        支持的命令类型：
+            - "write_register": 写单个 16 位寄存器（兼容原有方式）
+            - "write_data": 写入任意数据类型的值（自动编码为寄存器列表并批量写入）
+            - "write_multiple_data": 批量写入多个不同数据类型的数据点
+        """
         cmd_type = command.get("type")
         if cmd_type == "write_register":
             address = command.get("address")
             value = command.get("value")
             if address is not None and value is not None:
-                self._client.write_register(self._unit_id, address, value)
+                try:
+                    self._client.write_register(self._unit_id, address, value)
+                    self._logger.info(
+                        "Write register command executed: device=%s, address=%s, value=%s",
+                        self._device_id, address, value
+                    )
+                except ModbusException as e:
+                    self._logger.error("Write register command failed for device=%s: %s", self._device_id, e)
+                    self.comm_error.emit(self._device_id, f"Write register failed: {e}")
+                except Exception as e:
+                    self._logger.exception("Unexpected error during write register command for device=%s",
+                                           self._device_id)
+                    self.comm_error.emit(self._device_id, f"Unexpected write register error: {e}")
+
+        elif cmd_type == "write_data":
+            address = command.get("address")
+            value = command.get("value")
+            data_type = command.get("data_type", "int16")  # 默认 int16
+            byte_order = command.get("byte_order", "big_endian")
+            if address is None or value is None:
+                self._logger.warning("Write data command missing address or value: %s", command)
+                return
+            try:
+                # 将原始值编码为寄存器列表
+                registers = self._encode_value_to_registers(value, data_type, byte_order)
+                # 使用批量写入方法
+                self._client.write_registers(self._unit_id, address, registers)
+                self._logger.info(
+                    "Write data command executed: device=%s, address=%s, type=%s, byte_order=%s, registers=%s",
+                    self._device_id, address, data_type, byte_order, registers
+                )
+            except ModbusException as e:
+                self._logger.error("Write data command failed for device=%s: %s", self._device_id, e)
+                self.comm_error.emit(self._device_id, f"Write data failed: {e}")
+            except Exception as e:
+                self._logger.exception("Unexpected error during write data command for device=%s", self._device_id)
+                self.comm_error.emit(self._device_id, f"Unexpected write data error: {e}")
+
+        elif cmd_type == "write_multiple_data":
+            # 新增：批量写入多个不同数据类型的数据点
+            items = command.get("items", [])
+            if not isinstance(items, list) or not items:
+                self._logger.warning("Write multiple data command missing items or empty: %s", command)
+                return
+            # 遍历每个数据项，逐个编码并写入
+            for idx, item in enumerate(items):
+                # 每个 item 应包含 address, value, data_type, byte_order
+                address = item.get("address")
+                value = item.get("value")
+                data_type = item.get("data_type", "int16")
+                byte_order = item.get("byte_order", "big_endian")
+                if address is None or value is None:
+                    self._logger.warning("Item %d missing address or value, skipped", idx)
+                    continue
+                try:
+                    # 将原始值编码为寄存器列表
+                    registers = self._encode_value_to_registers(value, data_type, byte_order)
+                    # 执行批量写入（此处为单个数据点，但底层支持连续寄存器批量写）
+                    self._client.write_registers(self._unit_id, address, registers)
+                    self._logger.info(
+                        "Write multiple data item %d executed: device=%s, address=%s, type=%s, byte_order=%s, registers=%s",
+                        idx, self._device_id, address, data_type, byte_order, registers
+                    )
+                except ModbusException as e:
+                    self._logger.error("Write multiple data item %d failed: %s", idx, e)
+                    self.comm_error.emit(self._device_id, f"Write multiple data item {idx} failed: {e}")
+                except Exception as e:
+                    self._logger.exception("Unexpected error during write multiple data item %d", idx)
+                    self.comm_error.emit(self._device_id, f"Unexpected write multiple data error: {e}")
+        else:
+            self._logger.warning("Unknown command type: %s", cmd_type)
+
+    def _encode_value_to_registers(self, value: float, data_type: str, byte_order: str) -> List[int]:
+        """
+        根据数据类型和字节序，将原始值（int/float）编码为 Modbus 寄存器列表。
+
+        :param value: 待编码的值
+        :param data_type: 数据类型，支持 'int16', 'uint16', 'int32', 'uint32', 'float', 'string'
+        :param byte_order: 字节序，与 _parse_registers 中使用的字节序定义一致
+        :return: 编码后的寄存器值列表
+        :raises ValueError: 数据类型不支持或字节序非法
+        """
+        if data_type == "float":
+            return float_to_registers(value, byte_order)
+        elif data_type in ("int32", "uint32"):
+            signed = (data_type == "int32")
+            return int32_to_registers(int(value), signed, byte_order)
+        elif data_type in ("int16", "uint16"):
+            signed = (data_type == "int16")
+            # 单个寄存器，需确保数值在 16 位范围内
+            if signed and not (-32768 <= int(value) <= 32767):
+                raise ValueError("Int16 value out of range")
+            if not signed and not (0 <= int(value) <= 65535):
+                raise ValueError("Uint16 value out of range")
+            return [int(value)]
+        elif data_type == "string":
+            return string_to_registers(str(value), byte_order)
+        else:
+            raise ValueError(f"Unsupported data_type: {data_type}")
 
 
 class DeviceCommunicator(QObject):
@@ -363,19 +494,12 @@ class DeviceCommunicator(QObject):
         """安全停止通信线程"""
         self._worker.requestInterruption()  # 设置中断标志，run() 中的循环会退出
         self._worker.wait()                 # 等待线程完全退出
-        self._logger.info("Communicator (Device no - %s) stopped.", self._worker._device_id)
+        self._logger.info("Communicator (Device no - %s) stopped.", self._worker.device_id)
 
     def send_command(self, command: Dict[str, Any]):
         """向工作线程提交命令（跨线程安全）"""
-        QMetaObject.invokeMethod(
-            self._worker, "send_command",
-            Qt.ConnectionType.QueuedConnection,
-            Q_ARG(dict, command)
-        )
+        self._worker.send_command(command)
 
     def flush_cache(self):
         """请求工作线程补发缓存数据"""
-        QMetaObject.invokeMethod(
-            self._worker, "flush_cache",
-            Qt.ConnectionType.QueuedConnection
-        )
+        self._worker.flush_cache()

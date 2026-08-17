@@ -70,6 +70,22 @@ class IModbusClient(ABC):
         """
         ...
 
+    def write_registers(self, unit: int, address: int, values: List[int]) -> bool:
+        """
+        批量写入多个保持寄存器（默认实现：循环调用 write_register）。
+        子类可根据底层客户端特性重写此方法以提升效率。
+
+        :param unit: Modbus 从站地址
+        :param address: 起始寄存器地址
+        :param values: 要写入的寄存器值列表（每个元素 0~65535）
+        :return: 全部写入成功返回 True，否则返回 False
+        :raises ModbusException: 通信失败时抛出
+        """
+        for i, val in enumerate(values):
+            if not self.write_register(unit, address + i, val):
+                return False
+        return True
+
     @property
     @abstractmethod
     def is_connected(self) -> bool:

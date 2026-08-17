@@ -14,6 +14,8 @@ from PySide6.QtCore import QMutex, QMutexLocker
 class RingBuffer:
     """线程安全有界环形缓冲区"""
 
+    EMPTY = object()  # 哨兵对象，表示缓冲区为空
+
     def __init__(self, maxlen: int = 5000):
         """
         :param maxlen: 缓冲区最大容量，超出时自动丢弃最早数据
@@ -31,7 +33,7 @@ class RingBuffer:
         with QMutexLocker(self._mutex):
             if self._buffer:
                 return self._buffer.popleft()
-            return None
+            return RingBuffer.EMPTY
 
     def size(self) -> int:
         """返回当前元素个数（线程安全）"""

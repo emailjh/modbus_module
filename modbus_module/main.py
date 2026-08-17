@@ -7,6 +7,14 @@ from modbus_module.device_communicator import DeviceCommunicator
 
 
 # 导入独立模块
+BIG_ENDIAN = "big_endian"
+LITTLE_ENDIAN = "little_endian"
+BIG_ENDIAN_SWAP = "big_endian_swap"
+LITTLE_ENDIAN_SWAP = "little_endian_swap"
+
+FLOAT = "float"
+INT16 = "int16"
+INT32 = "int32"
 
 class MyApp(QObject):
     data_signal = Signal(str, dict)   # 接收采集数据
@@ -14,15 +22,15 @@ class MyApp(QObject):
     def __init__(self):
         super().__init__()
         # 配置连接参数（字典格式，符合新接口）
-        conn_params = {'host': '192.168.100.247', 'port': 503, 'timeout': 3.0}
+        conn_params = {'host': '192.168.100.247', 'port': 502, 'timeout': 3.0}
         # 因子配置列表（示例）
         factor_configs = [
             {
                 "factor": "PM2.5-环境湿度",
                 "register_address": 0,
                 "register_count": 2,
-                "data_type": "float32",
-                "byte_order": "little_endian_swap",
+                "data_type": INT16,
+                "byte_order": LITTLE_ENDIAN,
                 "scale": 1.0,
                 "offset": 0.0,
                 "is_enabled": True

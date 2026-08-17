@@ -127,6 +127,176 @@ class ConversionService:
             return register - 0x10000
         return register
 
+    @staticmethod
+    def float_to_registers(value: float, byte_order: str = "big_endian") -> List[int]:
+        """
+        将 32 位 IEEE 754 浮点数转换为两个 16 位 Modbus 寄存器值。
+
+        该函数是 registers_to_float 的逆操作，确保各种字节序下转换可逆。
+
+        :param value: 待转换的浮点数
+        :param byte_order: 字节序，与 registers_to_float 对应。
+        :return: 长度为 2 的寄存器值列表
+        :raises ValueError: 字节序非法
+        """
+        if byte_order == "big_endian":
+            # 大端字序 + 大端字节序：直接使用大端打包，拆分为两个大端寄存器
+            raw = struct.pack('>f', value)
+            return [int.from_bytes(raw[0:2], 'big'), int.from_bytes(raw[2:4], 'big')]
+
+        elif byte_order == "little_endian":
+            # 小端字序 + 小端字节序：使用小端打包，拆分为两个小端寄存器
+            raw = struct.pack('<f', value)
+            # 小端打包后的字节顺序为 [低字节, 高字节]，寄存器应按顺序取，但寄存器内字节也是小端
+            # 实际寄存器值 = 两个字节按小端解释
+            reg0 = raw[0] | (raw[1] << 8)
+            reg1 = raw[2] | (raw[3] << 8)
+            return [reg0, reg1]
+
+        elif byte_order == "big_endian_swap":
+            # 大端字序 + 小端字节序：先按小端打包浮点数，然后交换寄存器顺序
+            # 解码时使用 raw = pack('>HH', reg[1], reg[0]) -> unpack('<f')
+            # 因此编码时应：将浮点数按小端打包，拆分为两个寄存器，然后将它们交换顺序
+            raw_le = struct.pack('<f', value)
+            reg0 = raw_le[0] | (raw_le[1] << 8)  # 低字（小端）
+            reg1 = raw_le[2] | (raw_le[3] << 8)  # 高字（小端）
+            return [reg1, reg0]
+
+        elif byte_order == "little_endian_swap":
+            # 小端字序 + 大端字节序：先按大端打包浮点数，然后交换寄存器顺序
+            # 解码时使用 raw = pack('>HH', reg[1], reg[0]) -> unpack('>f')
+            raw_be = struct.pack('>f', value)
+            reg0 = raw_be[0] << 8 | raw_be[1]  # 高字（大端）
+            reg1 = raw_be[2] << 8 | raw_be[3]  # 低字（大端）
+            return [reg1, reg0]
+
+        else:
+            raise ValueError(_TR(_CONTEXT, "Unknown byte_order: %1").arg(byte_order))
+
+    @staticmethod
+    def int32_to_registers(value: int, signed: bool = True, byte_order: str = "big_endian") -> List[int]:
+        """
+        将 32 位整数转换为两个 16 位 Modbus 寄存器值。
+
+        :param value: 待转换的整数（若 signed=True，范围为 -2^31 ~ 2^31-1；否则 0 ~ 2^32-1）
+        :param signed: 是否为有符号整数
+        :param byte_order: 字节序，与 registers_to_int32 对应。
+        :return: 长度为 2 的寄存器值列表
+        :raises ValueError: 数值超出范围或字节序非法
+        """
+        # 检查范围
+        if signed and not (-2**31 <= value <= 2**31 - 1):
+            raise ValueError(_TR(_CONTEXT, "Signed int32 value out of range"))
+        if not signed and not (0 <= value <= 2**32 - 1):
+            raise ValueError(_TR(_CONTEXT, "Unsigned int32 value out of range"))
+
+        if byte_order == "big_endian":
+            raw = struct.pack('>i', value) if signed else struct.pack('>I', value)
+            return [int.from_bytes(raw[0:2], 'big'), int.from_bytes(raw[2:4], 'big')]
+
+        elif byte_order == "little_endian":
+            raw = struct.pack('<i', value) if signed else struct.pack('<I', value)
+            reg0 = raw[0] | (raw[1] << 8)
+            reg1 = raw[2] | (raw[3] << 8)
+            return [reg0, reg1]
+
+        elif byte_order == "big_endian_swap":
+            # 对应解码: pack('>HH', reg[1], reg[0]) -> unpack('<i')
+            raw_le = struct.pack('<i', value) if signed else struct.pack('<I', value)
+            reg0 = raw_le[0] | (raw_le[1] << 8)
+            reg1 = raw_le[2] | (raw_le[3] << 8)
+            return [reg1, reg0]
+
+        elif byte_order == "little_endian_swap":
+            # 对应解码: pack('>HH', reg[1], reg[0]) -> unpack('>i')
+            raw_be = struct.pack('>i', value) if signed else struct.pack('>I', value)
+            reg0 = raw_be[0] << 8 | raw_be[1]
+            reg1 = raw_be[2] << 8 | raw_be[3]
+            return [reg1, reg0]
+
+        else:
+            raise ValueError(_TR(_CONTEXT, "Unknown byte_order: %1").arg(byte_order))
+
+    @staticmethod
+    def string_to_registers(text: str, byte_order: str) -> List[int]:
+        """
+        将 ASCII 字符串转换为 Modbus 寄存器列表。
+        每个寄存器存放两个字符，字符串长度不足偶数时填充 0x00。
+
+        :param text: 待转换的字符串（仅支持 ASCII 字符）
+        :param byte_order: 'big_endian'、'little_endian'、'big_endian_swap' 或 'little_endian_swap'。
+                           对于字符串，swap 变体与对应基础字节序行为相同。
+        :return: 寄存器值列表
+        """
+        # 确保字符串为 ASCII 编码（每个字符一个字节）
+        try:
+            encoded = text.encode('ascii')
+        except UnicodeEncodeError:
+            raise ValueError("Only ASCII strings are supported")
+
+        # 若长度为奇数，补一个空字节
+        if len(encoded) % 2 != 0:
+            encoded += b'\x00'
+
+        # 对于字符串，swap 变体等同于对应的基础字节序
+        if byte_order in ("big_endian_swap",):
+            byte_order = "big_endian"
+        elif byte_order in ("little_endian_swap",):
+            byte_order = "little_endian"
+
+        registers = []
+        for i in range(0, len(encoded), 2):
+            high_byte = encoded[i]
+            low_byte = encoded[i + 1]
+            if byte_order == "big_endian":
+                # 高字节在前（第一个字符在高字节）
+                reg_value = (high_byte << 8) | low_byte
+            elif byte_order == "little_endian":
+                # 低字节在前（第一个字符在低字节）
+                reg_value = (low_byte << 8) | high_byte
+            else:
+                raise ValueError(f"Unsupported byte_order for string: {byte_order}")
+            registers.append(reg_value)
+        return registers
+
+    @staticmethod
+    def registers_to_string(registers: List[int], byte_order: str = "big_endian") -> str:
+        """
+        将 Modbus 寄存器列表转换为 ASCII 字符串。
+        每个寄存器包含两个字符，顺序由 byte_order 决定。
+
+        :param registers: 寄存器值列表（每个元素 0~65535）
+        :param byte_order: 'big_endian' 或 'little_endian'，swap 变体自动映射为基础字节序
+        :return: 解码后的字符串（自动去除尾部填充的空字符和空格）
+        """
+        # 将 swap 变体映射为基础字节序（字符串不涉及多寄存器顺序交换）
+        if byte_order in ("big_endian_swap",):
+            byte_order = "big_endian"
+        elif byte_order in ("little_endian_swap",):
+            byte_order = "little_endian"
+
+        chars = []
+        for reg in registers:
+            if not (0 <= reg <= 0xFFFF):
+                raise ValueError("Register value must be between 0 and 65535")
+            if byte_order == "big_endian":
+                # 高字节在前（第一个字符在高字节）
+                high_byte = (reg >> 8) & 0xFF
+                low_byte = reg & 0xFF
+            elif byte_order == "little_endian":
+                # 低字节在前（第一个字符在低字节）
+                high_byte = reg & 0xFF
+                low_byte = (reg >> 8) & 0xFF
+            else:
+                raise ValueError(f"Unsupported byte_order for string: {byte_order}")
+            # 将字节转换为字符，0x00 和 0x20 视为填充，但保留中间可能出现的有效空格
+            # 这里先收集所有字符，最后统一去除尾部填充
+            chars.append(chr(high_byte))
+            chars.append(chr(low_byte))
+
+        # 去掉字符串末尾的填充字符（空字符或空格），保留中间内容
+        result = ''.join(chars).rstrip('\x00 ')
+        return result
     # ===================== 浓度单位换算（无温压补偿） =====================
 
     # 标准摩尔体积 (25°C, 101.325 kPa)，单位 L/mol
@@ -279,9 +449,13 @@ class ConversionService:
 modbus_to_float = ConversionService.registers_to_float
 modbus_to_int32 = ConversionService.registers_to_int32
 modbus_to_int16 = ConversionService.register_to_int16
+modbus_to_string = ConversionService.registers_to_string
 ppm_to_mgm3 = ConversionService.ppm_to_mgm3
 ppb_to_mgm3 = ConversionService.ppb_to_mgm3
 mgm3_to_ppm = ConversionService.mgm3_to_ppm
 ppm_to_ugm3 = ConversionService.ppm_to_ugm3
 ppb_to_ugm3 = ConversionService.ppb_to_ugm3
 ugm3_to_ppm = ConversionService.ugm3_to_ppm
+float_to_registers = ConversionService.float_to_registers
+int32_to_registers = ConversionService.int32_to_registers
+string_to_registers = ConversionService.string_to_registers

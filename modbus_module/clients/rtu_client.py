@@ -155,3 +155,29 @@ class PymodbusRtuClient(IModbusClient):
         except Exception as e:
             self._logger.error(f"Unexpected error during RTU write register: {e}")
             raise ModbusException(f"Modbus RTU write error: {e}") from e
+
+    def write_registers(self, unit: int, address: int, values: List[int]) -> bool:
+        """
+        批量写入多个保持寄存器（高效实现，使用 pymodbus 的 write_registers）。
+
+        :param unit: 从站地址
+        :param address: 起始寄存器地址
+        :param values: 寄存器值列表
+        :return: 成功返回 True
+        :raises ModbusException: 通信失败或 pymodbus 返回错误时抛出
+        """
+        self._ensure_connected()
+        try:
+            result = self._client.write_registers(address=address, values=values, device_id=unit)
+            if result.isError():
+                error_msg = f"Modbus RTU write registers error: {result}"
+                self._logger.error(error_msg)
+                raise ModbusException(error_msg)
+            return True
+        except ModbusIOException as e:
+            self._logger.error(f"Modbus RTU I/O exception: {e}")
+            self._client.close()
+            raise ModbusException(f"Modbus RTU I/O error: {e}") from e
+        except Exception as e:
+            self._logger.error(f"Unexpected error during RTU write registers: {e}")
+            raise ModbusException(f"Modbus RTU write error: {e}") from e

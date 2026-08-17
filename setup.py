@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='modbus_module',                    # 包名（安装后 import 使用的名称）
-    version='0.1.0',
+    version='0.1.3',
     description='Reusable Modbus communication module based on PySide6 and pymodbus',
     author='emailjh',
     packages=find_packages(),                # 自动找到 modbus_module 包
