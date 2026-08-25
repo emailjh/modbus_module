@@ -440,6 +440,7 @@ class DeviceCommunicator(QObject):
     提供与之前相同的接口，内部管理 _CommunicatorWorker 线程。
     外部通过 start() 启动、stop() 停止、send_command() 发送命令。
     连接状态可通过 is_connected 属性或 connection_changed 信号获取。
+    支持多次 start/stop 安全重启。
     """
 
     # 外壳信号的参数与 Worker 完全一致，直接转发
@@ -460,10 +461,40 @@ class DeviceCommunicator(QObject):
     ):
         super().__init__()
         self._logger = logger or get_logger(__name__)
-        # 创建工作线程
+
+        # 保存构造参数，以便重新创建 Worker
+        self._device_id = device_id
+        self._client = client
+        self._factor_configs = factor_configs
+        self._connection_params = connection_params
+        self._poll_interval = poll_interval
+        self._cache_db = cache_db
+        self._unit_id = unit_id
+
+        self._worker: Optional[_CommunicatorWorker] = None
+        self._connected = False
+
+        # 初始创建 Worker
+        self._create_worker()
+
+    def _create_worker(self):
+        """
+        创建 _CommunicatorWorker 实例并连接信号。
+        此方法通常在 __init__ 或 start() 中调用。
+        """
+        if self._worker is not None:
+            self._logger.warning("Worker already exists, skipping creation.")
+            return
+
         self._worker = _CommunicatorWorker(
-            device_id, client, factor_configs, connection_params,
-            poll_interval, cache_db, unit_id, self._logger
+            self._device_id,
+            self._client,
+            self._factor_configs,
+            self._connection_params,
+            self._poll_interval,
+            self._cache_db,
+            self._unit_id,
+            self._logger
         )
 
         # 转发信号
@@ -471,8 +502,6 @@ class DeviceCommunicator(QObject):
         self._worker.comm_error.connect(self.comm_error)
         # 连接 connection_changed 信号：先经过内部槽更新状态，再转发
         self._worker.connection_changed.connect(self._on_worker_connection_changed)
-
-        self._connected = False
 
     @Slot(str, bool)
     def _on_worker_connection_changed(self, device_id: str, connected: bool):
@@ -487,19 +516,46 @@ class DeviceCommunicator(QObject):
         return self._connected
 
     def start(self):
-        """启动通信线程（QThread.start）"""
+        """启动通信线程。若 Worker 已销毁，则重新创建后再启动。"""
+        if self._worker is None:
+            self._logger.info("Worker is None, recreating worker before start.")
+            self._create_worker()
         self._worker.start()
 
     def stop(self):
-        """安全停止通信线程"""
-        self._worker.requestInterruption()  # 设置中断标志，run() 中的循环会退出
-        self._worker.wait()                 # 等待线程完全退出
-        self._logger.info("Communicator (Device no - %s) stopped.", self._worker.device_id)
+        """安全停止通信线程，并清理资源"""
+        if self._worker is not None:
+            # 请求中断并等待线程完全退出
+            self._worker.requestInterruption()
+            self._worker.wait()
+
+            # 断开所有信号连接，防止悬空引用
+            try:
+                self._worker.data_ready.disconnect(self.data_ready)
+                self._worker.comm_error.disconnect(self.comm_error)
+                self._worker.connection_changed.disconnect(self._on_worker_connection_changed)
+            except Exception as e:
+                self._logger.debug("Error disconnecting signals: %s", e)
+
+            # 删除底层 C++ 对象，并清除 Python 引用
+            self._worker.deleteLater()
+            self._worker = None
+            self._connected = False
+
+            self._logger.info("Communicator (Device no - %s) stopped and cleaned up.", self._device_id)
+        else:
+            self._logger.info("Communicator already stopped or not started.")
 
     def send_command(self, command: Dict[str, Any]):
         """向工作线程提交命令（跨线程安全）"""
+        if self._worker is None:
+            self._logger.warning("Cannot send command: worker is not running.")
+            return
         self._worker.send_command(command)
 
     def flush_cache(self):
         """请求工作线程补发缓存数据"""
+        if self._worker is None:
+            self._logger.warning("Cannot flush cache: worker is not running.")
+            return
         self._worker.flush_cache()

@@ -7,6 +7,8 @@
 from typing import List, Optional, Dict, Any
 from pymodbus.client import ModbusSerialClient as _ModbusSerialClient
 from pymodbus.exceptions import ConnectionException, ModbusIOException
+from pymodbus.pdu import ReadHoldingRegistersRequest
+from pymodbus.pdu.register_message import ReadInputRegistersRequest
 
 from modbus_module.constants import *
 from modbus_module.interfaces import IModbusClient, ModbusException
@@ -66,6 +68,13 @@ class PymodbusRtuClient(IModbusClient):
             )
             connected = self._client.connect()
             if connected:
+                # 二次确认：确保底层串口真正打开
+                socket = getattr(self._client, 'socket', None)
+                if socket is None or not getattr(socket, 'is_open', False):
+                    self._logger.error(f"Modbus RTU connection reported success but port not open: {port}")
+                    self._client.close()
+                    self._client = None
+                    return False
                 self._logger.info(f"Modbus RTU connected on {port}, baudrate={baudrate}")
             else:
                 self._logger.error(f"Modbus RTU connection failed: {port}")
@@ -104,8 +113,43 @@ class PymodbusRtuClient(IModbusClient):
             if not self.is_connected:
                 raise ModbusException("Modbus RTU client is not connected")
 
-    # ---------- 数据读写（以下方法未改动） ----------
+    # ---------- 数据读写 ----------
+    def _read_broadcast(self, request_class, address: int, count: int, unit: int):
+        """
+        处理广播读（unit=0）：使用底层传输发送请求并解析响应，
+        绕过 pymodbus 的单元 ID 匹配检查。
+        """
+        self._ensure_connected()
+        try:
+            # 构造请求对象（pymodbus 内部使用 slave 参数）
+            request = request_class(address=address, count=count, slave=unit)
+            # 构建请求帧
+            packet = self._client.framer.buildPacket(request)
+            # 发送请求
+            self._client.transport.send(packet)
+            # 接收响应帧（超时使用客户端超时）
+            response_packet = self._client.transport.recv(self._timeout)
+            if not response_packet:
+                raise ModbusException("No response received for broadcast read")
+            # 解码响应帧，得到响应对象（unit_id 为实际从站地址）
+            response = self._client.framer.decode_data(response_packet)
+            if response is None:
+                raise ModbusException("Failed to decode broadcast response")
+            # 检查是否为错误响应
+            if response.function_code >= 0x80:
+                raise ModbusException(f"Broadcast read error: {response}")
+            # 返回寄存器值
+            return response.registers
+        except ModbusException:
+            raise
+        except Exception as e:
+            self._logger.error(f"Broadcast read exception: {e}")
+            raise ModbusException(f"Broadcast read failed: {e}") from e
+
     def read_holding_registers(self, unit: int, address: int, count: int) -> List[int]:
+        # 广播读特殊处理
+        if unit == 0:
+            return self._read_broadcast(ReadHoldingRegistersRequest, address, count, unit)
         self._ensure_connected()
         try:
             result = self._client.read_holding_registers(address=address, count=count, device_id=unit)
@@ -123,6 +167,9 @@ class PymodbusRtuClient(IModbusClient):
             raise ModbusException(f"Modbus RTU read error: {e}") from e
 
     def read_input_registers(self, unit: int, address: int, count: int) -> List[int]:
+        # 广播读特殊处理
+        if unit == 0:
+            return self._read_broadcast(ReadInputRegistersRequest, address, count, unit)
         self._ensure_connected()
         try:
             result = self._client.read_input_registers(address=address, count=count, device_id=unit)
