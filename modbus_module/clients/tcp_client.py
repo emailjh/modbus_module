@@ -88,30 +88,47 @@ class PymodbusTcpClient(IModbusClient):
     # ---------- 数据读写 ----------
     def _read_broadcast(self, request_class, address: int, count: int, unit: int):
         """
-        处理广播读（unit=0）：使用底层传输发送请求并解析响应，
-        绕过 pymodbus 的单元 ID 匹配检查。
+        处理广播读（unit=0）：手动构造 Modbus TCP 请求帧，发送并解析响应，
+        绕过 pymodbus 的设备 ID 匹配检查。
         """
         self._ensure_connected()
         try:
-            # 构造请求对象（pymodbus 内部使用 slave 参数）
-            request = request_class(address=address, count=count, slave=unit)
-            # 构建请求帧
-            packet = self._client.framer.buildPacket(request)
-            # 发送请求
+            # 确定功能码
+            if request_class == ReadHoldingRegistersRequest:
+                func_code = 0x03
+            elif request_class == ReadInputRegistersRequest:
+                func_code = 0x04
+            else:
+                raise ModbusException("Unsupported request class for broadcast read")
+
+            # 手动构造 PDU：功能码 + 起始地址(2字节) + 数量(2字节)
+            pdu = bytes([func_code]) + struct.pack('>HH', address, count)
+
+            # 构造 MBAP 头：事务标识=0，协议标识=0，长度=单元标识(1)+PDU长度，单元标识=0
+            mbap = struct.pack('>HHHB', 0, 0, len(pdu) + 1, 0)
+            packet = mbap + pdu
+
+            # 发送请求帧
             self._client.transport.send(packet)
-            # 接收响应帧（超时使用客户端超时）
+
+            # 接收响应帧
             response_packet = self._client.transport.recv(self._timeout)
             if not response_packet:
                 raise ModbusException("No response received for broadcast read")
-            # 解码响应帧，得到响应对象（unit_id 为实际从站地址）
-            response = self._client.framer.decode_data(response_packet)
-            if response is None:
-                raise ModbusException("Failed to decode broadcast response")
-            # 检查是否为错误响应
-            if response.function_code >= 0x80:
-                raise ModbusException(f"Broadcast read error: {response}")
-            # 返回寄存器值
-            return response.registers
+
+            # 解析响应（MBAP头7字节 + 功能码1字节 + 字节数1字节 + 数据）
+            if len(response_packet) < 9:
+                raise ModbusException("Response too short")
+            resp_func = response_packet[7]
+            byte_count = response_packet[8]
+            data_bytes = response_packet[9:9 + byte_count]
+
+            if resp_func >= 0x80:
+                raise ModbusException(f"Broadcast read error (function code {resp_func})")
+
+            # 转换为寄存器列表（大端）
+            registers = [int.from_bytes(data_bytes[i:i + 2], 'big') for i in range(0, len(data_bytes), 2)]
+            return registers
         except ModbusException:
             raise
         except Exception as e:

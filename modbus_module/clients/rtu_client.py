@@ -116,30 +116,67 @@ class PymodbusRtuClient(IModbusClient):
     # ---------- 数据读写 ----------
     def _read_broadcast(self, request_class, address: int, count: int, unit: int):
         """
-        处理广播读（unit=0）：使用底层传输发送请求并解析响应，
-        绕过 pymodbus 的单元 ID 匹配检查。
+        处理广播读（unit=0）：手动构造 Modbus RTU 请求帧，发送并解析响应，
+        绕过 pymodbus 的设备 ID 匹配检查。
         """
         self._ensure_connected()
         try:
-            # 构造请求对象（pymodbus 内部使用 slave 参数）
-            request = request_class(address=address, count=count, slave=unit)
-            # 构建请求帧
-            packet = self._client.framer.buildPacket(request)
+            # 确定功能码
+            if request_class == ReadHoldingRegistersRequest:
+                func_code = 0x03
+            elif request_class == ReadInputRegistersRequest:
+                func_code = 0x04
+            else:
+                raise ModbusException("Unsupported request class for broadcast read")
+
+            # 手动构造帧：地址(0) + 功能码 + 起始地址(2字节) + 数量(2字节)
+            frame = bytes([0]) + bytes([func_code]) + struct.pack('>HH', address, count)
+            # 计算并追加 CRC16
+            crc = self._compute_crc(frame)
+            packet = frame + crc
+
+            # 获取串口对象（兼容多种属性名，并输出调试日志）
+            serial = None
+            candidate_attrs = ['socket', 'serial', '_serial', 'transport', 'client', '_client', 'stream']
+            for attr in candidate_attrs:
+                obj = getattr(self._client, attr, None)
+                if obj is not None and hasattr(obj, 'write') and hasattr(obj, 'read'):
+                    serial = obj
+                    self._logger.debug(f"Found serial object in attribute '{attr}'")
+                    break
+            if serial is None:
+                attrs = [a for a in dir(self._client) if not a.startswith('_')]
+                self._logger.error("Available client attributes: %s", attrs)
+                raise ModbusException("Cannot find serial object for RTU client")
+
             # 发送请求
-            self._client.transport.send(packet)
-            # 接收响应帧（超时使用客户端超时）
-            response_packet = self._client.transport.recv(self._timeout)
-            if not response_packet:
-                raise ModbusException("No response received for broadcast read")
-            # 解码响应帧，得到响应对象（unit_id 为实际从站地址）
-            response = self._client.framer.decode_data(response_packet)
-            if response is None:
-                raise ModbusException("Failed to decode broadcast response")
-            # 检查是否为错误响应
-            if response.function_code >= 0x80:
-                raise ModbusException(f"Broadcast read error: {response}")
-            # 返回寄存器值
-            return response.registers
+            serial.write(packet)
+            serial.flush()
+
+            # 接收响应：先读取3字节（地址、功能码、字节数）
+            header = serial.read(3)
+            if len(header) < 3:
+                raise ModbusException("Timeout waiting for response header")
+
+            resp_func = header[1]
+            byte_count = header[2]
+
+            if resp_func >= 0x80:
+                # 异常响应，读取2字节（异常码+CRC）后抛错
+                _ = serial.read(2)
+                raise ModbusException(f"Broadcast read error (function code {resp_func})")
+
+            # 正常响应：读取数据部分 + CRC
+            remaining = byte_count + 2
+            data_and_crc = serial.read(remaining)
+            if len(data_and_crc) < remaining:
+                raise ModbusException("Timeout waiting for response data")
+
+            data_bytes = data_and_crc[:byte_count]
+
+            # 转换为寄存器列表（大端）
+            registers = [int.from_bytes(data_bytes[i:i + 2], 'big') for i in range(0, len(data_bytes), 2)]
+            return registers
         except ModbusException:
             raise
         except Exception as e:

@@ -92,6 +92,19 @@ class IModbusClient(ABC):
         """返回当前连接状态"""
         ...
 
+    @staticmethod
+    def _compute_crc(data: bytes) -> bytes:
+        """计算 Modbus RTU CRC16，返回小端序两字节"""
+        crc = 0xFFFF
+        for byte in data:
+            crc ^= byte
+            for _ in range(8):
+                if crc & 0x0001:
+                    crc >>= 1
+                    crc ^= 0xA001
+                else:
+                    crc >>= 1
+        return crc.to_bytes(2, 'little')
 
 class IReportProtocol(ABC):
     """数据上报协议抽象接口"""
