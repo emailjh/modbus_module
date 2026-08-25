@@ -3,7 +3,7 @@
 基于 pymodbus 的 Modbus TCP 客户端实现。
 支持自动重连、超时设置，异常统一封装。
 """
-
+import struct
 from typing import List, Optional, Dict, Any
 from pymodbus.client import ModbusTcpClient as _ModbusTcpClient
 from pymodbus.exceptions import ConnectionException, ModbusIOException
