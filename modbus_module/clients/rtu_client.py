@@ -118,6 +118,8 @@ class PymodbusRtuClient(IModbusClient):
         """
         处理广播读（unit=0）：手动构造 Modbus RTU 请求帧，发送并解析响应，
         绕过 pymodbus 的设备 ID 匹配检查。
+        注意：此为非标 Modbus 行为，标准协议广播读不应有应答；仅适配厂商扩展设备。
+        已补充接收帧 CRC16 校验，增加应答从站ID简单校验。
         """
         self._ensure_connected()
         try:
@@ -158,25 +160,44 @@ class PymodbusRtuClient(IModbusClient):
             if len(header) < 3:
                 raise ModbusException("Timeout waiting for response header")
 
+            resp_unit_id = header[0]
             resp_func = header[1]
             byte_count = header[2]
 
-            if resp_func >= 0x80:
-                # 异常响应，读取2字节（异常码+CRC）后抛错
-                _ = serial.read(2)
-                raise ModbusException(f"Broadcast read error (function code {resp_func})")
+            # 应答从站 ID ：允许返回非0真实从站id（广播读场景）
+            if resp_unit_id == 0:
+                self._logger.warning("Broadcast response returned unit id = 0")
 
-            # 正常响应：读取数据部分 + CRC
+            if resp_func >= 0x80:
+                # 异常响应：读取异常码(1)+CRC(2)，共3字节
+                error_payload = serial.read(3)
+                self._logger.debug(f"Modbus exception response payload: {error_payload.hex()}")
+                raise ModbusException(f"Broadcast read error (function code {resp_func:#04x})")
+
+            # 正常响应：读取数据部分 + CRC 2字节
             remaining = byte_count + 2
             data_and_crc = serial.read(remaining)
             if len(data_and_crc) < remaining:
                 raise ModbusException("Timeout waiting for response data")
+
+            # 完整应答报文 = header + data部分（不含收到的CRC）
+            response_body = header + data_and_crc[:-2]
+            received_crc_bytes = data_and_crc[-2:]
+            received_crc = int.from_bytes(received_crc_bytes, byteorder="little")
+            calc_crc = self._compute_crc(response_body)
+
+            # 响应 CRC16 校验
+            if calc_crc != received_crc:
+                raise ModbusException(
+                    f"Response CRC check failed. calc:{calc_crc:#06x}, recv:{received_crc:#06x}"
+                )
 
             data_bytes = data_and_crc[:byte_count]
 
             # 转换为寄存器列表（大端）
             registers = [int.from_bytes(data_bytes[i:i + 2], 'big') for i in range(0, len(data_bytes), 2)]
             return registers
+
         except ModbusException:
             raise
         except Exception as e:
